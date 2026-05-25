@@ -88,7 +88,13 @@ def cmd_build(model_id: str) -> None:
         sys.exit(1)
 
     py_file = Path(entry["py_file"])
-    stl_name = Path(entry["stl_file"]).name
+    # Derive step/stl paths from py_file stem (handles null after a failed build)
+    step_file = py_file.with_suffix(".step")
+    stl_file  = py_file.with_suffix(".stl")
+    stl_name  = stl_file.name
+    # Keep index paths current
+    entry["step_file"] = str(step_file)
+    entry["stl_file"]  = str(stl_file)
 
     if not py_file.exists():
         print(f"Python file not found: {py_file}")
@@ -107,8 +113,6 @@ def cmd_build(model_id: str) -> None:
         cwd=str(SKILL_DIR),
     )
 
-    step_file = Path(entry["step_file"])
-    stl_file = Path(entry["stl_file"])
     ok = result.returncode == 0 and step_file.exists()
 
     entry["built"] = ok
