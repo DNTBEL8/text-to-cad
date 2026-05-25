@@ -1,18 +1,15 @@
 #!/usr/bin/env python3
-"""3D Print Farm Bot - Generate, manage, and track 3D prints using Claude AI."""
+"""3D Print Farm Bot - manage and track 3D prints for a print farm business."""
 
 from __future__ import annotations
 
 import argparse
 import json
-import os
 import subprocess
 import sys
 import uuid
 from datetime import datetime
 from pathlib import Path
-
-import anthropic
 
 SKILL_DIR = Path(__file__).parent / "skills" / "cad"
 RENDER_DIR = Path(__file__).parent / "skills" / "render"
@@ -20,37 +17,7 @@ DATA_DIR = Path(__file__).parent / "print_farm"
 MODELS_DIR = DATA_DIR / "models"
 QUEUE_FILE = DATA_DIR / "queue.json"
 INVENTORY_FILE = DATA_DIR / "inventory.json"
-
-MODEL_ID = "claude-opus-4-7"
-
-BUILD123D_SYSTEM_PROMPT = """You are a CAD expert that generates build123d Python code to create 3D printable parts.
-
-Rules:
-- Always define a `gen_step()` function that returns a build123d Shape or Compound
-- Use millimeters for all dimensions
-- Ensure closed, manifold solids suitable for 3D printing
-- Include wall thickness >= 1.5mm for thin-walled objects
-- Use parametric style with named variables at the top
-- Only import from build123d (e.g. `from build123d import *`)
-- Do NOT include any file I/O, display calls, or if __name__ == "__main__" blocks
-- The gen_step() function is the ONLY required output
-
-Example structure:
-```python
-from build123d import *
-
-# Parameters
-width = 40
-height = 20
-depth = 30
-wall = 2
-
-def gen_step():
-    box = Box(width, height, depth)
-    return box
-```
-
-Generate ONLY the Python code, no markdown fences, no explanations."""
+INDEX_FILE = DATA_DIR / "models_index.json"
 
 
 def _load_json(path: Path) -> dict:
@@ -64,143 +31,127 @@ def _save_json(path: Path, data: dict) -> None:
     path.write_text(json.dumps(data, indent=2))
 
 
-def _load_queue() -> dict:
+def _idx() -> dict:
+    return _load_json(INDEX_FILE)
+
+
+def _queue() -> dict:
     return _load_json(QUEUE_FILE)
 
 
-def _load_inventory() -> dict:
+def _inv() -> dict:
     return _load_json(INVENTORY_FILE)
 
 
-def _load_models_index() -> dict:
-    index_path = DATA_DIR / "models_index.json"
-    return _load_json(index_path)
-
-
-def _save_models_index(data: dict) -> None:
-    index_path = DATA_DIR / "models_index.json"
-    _save_json(index_path, data)
-
-
-def cmd_generate(description: str, name: str | None = None) -> None:
-    """Generate a 3D model from a text description using Claude."""
-    client = anthropic.Anthropic()
-
+def cmd_new(name: str, description: str) -> None:
+    """Reserve a new model slot and print the paths Claude should write to."""
     model_id = str(uuid.uuid4())[:8]
-    safe_name = (name or description[:40]).replace(" ", "_").replace("/", "_")
+    safe = name.replace(" ", "_").replace("/", "_")
     model_dir = MODELS_DIR / model_id
     model_dir.mkdir(parents=True, exist_ok=True)
-    py_file = model_dir / f"{safe_name}.py"
-    step_file = model_dir / f"{safe_name}.step"
-    stl_file = model_dir / f"{safe_name}.stl"
+    py_file = model_dir / f"{safe}.py"
+    step_file = model_dir / f"{safe}.step"
+    stl_file = model_dir / f"{safe}.stl"
 
-    print(f"Generating 3D model for: {description}")
-    print("Asking Claude to generate build123d code...")
+    index = _idx()
+    index[model_id] = {
+        "id": model_id,
+        "name": safe,
+        "description": description,
+        "created_at": datetime.now().isoformat(),
+        "py_file": str(py_file),
+        "step_file": str(step_file),
+        "stl_file": str(stl_file),
+        "built": False,
+    }
+    _save_json(INDEX_FILE, index)
 
-    code_parts: list[str] = []
+    print(f"model_id={model_id}")
+    print(f"py_file={py_file}")
+    print(f"step_file={step_file}")
+    print(f"stl_file={stl_file}")
+    print(f"stl_name={stl_file.name}")
+    print(f"skill_dir={SKILL_DIR}")
 
-    with client.messages.stream(
-        model=MODEL_ID,
-        max_tokens=4096,
-        thinking={"type": "adaptive"},
-        system=BUILD123D_SYSTEM_PROMPT,
-        messages=[
-            {
-                "role": "user",
-                "content": f"Generate build123d Python code for a 3D printable object: {description}",
-            }
-        ],
-    ) as stream:
-        for text in stream.text_stream:
-            print(text, end="", flush=True)
-            code_parts.append(text)
 
-    print()
-    code = "".join(code_parts).strip()
+def cmd_build(model_id: str) -> None:
+    """Run the CAD pipeline for an already-written Python file."""
+    index = _idx()
+    entry = index.get(model_id)
+    if not entry:
+        print(f"Model '{model_id}' not found. Use 'list' to see available models.")
+        sys.exit(1)
 
-    # Strip any accidental markdown fences
-    if code.startswith("```"):
-        lines = code.splitlines()
-        code = "\n".join(
-            line for line in lines if not line.startswith("```")
-        ).strip()
+    py_file = Path(entry["py_file"])
+    stl_name = Path(entry["stl_file"]).name
 
-    py_file.write_text(code)
-    print(f"\nCode saved to: {py_file}")
+    if not py_file.exists():
+        print(f"Python file not found: {py_file}")
+        sys.exit(1)
 
-    print("\nRunning CAD generation...")
+    print(f"Building {py_file.name}...")
     result = subprocess.run(
         [
             sys.executable,
             "scripts/step",
             str(py_file.resolve()),
             "--stl",
-            str(stl_file.resolve()),
+            stl_name,
             "--skip-explorer",
             "--verbose",
         ],
         cwd=str(SKILL_DIR),
-        capture_output=False,
     )
 
-    if result.returncode != 0:
-        print(f"\nCAD generation failed (exit {result.returncode}).")
-        print("The generated Python file is saved — you can inspect or fix it manually.")
+    step_file = Path(entry["step_file"])
+    stl_file = Path(entry["stl_file"])
+    ok = result.returncode == 0 and step_file.exists()
+
+    entry["built"] = ok
+    entry["step_file"] = str(step_file) if step_file.exists() else None
+    entry["stl_file"] = str(stl_file) if stl_file.exists() else None
+    _save_json(INDEX_FILE, index)
+
+    if ok:
+        print(f"\nSTEP: {step_file}")
+        print(f"STL:  {stl_file}")
+        print(f"\nModel ID: {model_id}")
     else:
-        print(f"\nSTEP file: {step_file}")
-        print(f"STL file:  {stl_file}")
-
-    index = _load_models_index()
-    index[model_id] = {
-        "id": model_id,
-        "name": safe_name,
-        "description": description,
-        "created_at": datetime.now().isoformat(),
-        "py_file": str(py_file),
-        "step_file": str(step_file) if step_file.exists() else None,
-        "stl_file": str(stl_file) if stl_file.exists() else None,
-        "generation_ok": result.returncode == 0,
-    }
-    _save_models_index(index)
-
-    print(f"\nModel ID: {model_id}")
-    print("Use 'view {model_id}' to preview in 3D viewer.")
-    print("Use 'queue add {model_id}' to add to print queue.")
+        print(f"\nBuild failed (exit {result.returncode}).")
+        sys.exit(result.returncode)
 
 
 def cmd_list() -> None:
-    """List all generated models."""
-    index = _load_models_index()
+    """List all registered models."""
+    index = _idx()
     if not index:
-        print("No models generated yet. Use 'generate <description>' to create one.")
+        print("No models yet. Ask me to generate one!")
         return
-
-    print(f"{'ID':<10} {'Name':<35} {'Status':<8} {'Created'}")
-    print("-" * 75)
-    for entry in sorted(index.values(), key=lambda e: e["created_at"]):
-        status = "ok" if entry.get("generation_ok") else "fail"
-        created = entry["created_at"][:16].replace("T", " ")
-        print(f"{entry['id']:<10} {entry['name']:<35} {status:<8} {created}")
+    print(f"{'ID':<10} {'Name':<35} {'Built':<6} {'Created'}")
+    print("-" * 70)
+    for e in sorted(index.values(), key=lambda x: x["created_at"]):
+        built = "yes" if e.get("built") else "no"
+        ts = e["created_at"][:16].replace("T", " ")
+        print(f"{e['id']:<10} {e['name']:<35} {built:<6} {ts}")
 
 
 def cmd_view(model_id: str) -> None:
-    """View a model in the 3D viewer."""
-    index = _load_models_index()
+    """Open a model in the 3D viewer."""
+    index = _idx()
     entry = index.get(model_id)
     if not entry:
-        print(f"Model '{model_id}' not found. Use 'list' to see available models.")
+        print(f"Model '{model_id}' not found.")
         return
 
-    step_file = entry.get("step_file")
-    stl_file = entry.get("stl_file")
-    target = step_file if step_file and Path(step_file).exists() else stl_file
+    step = entry.get("step_file")
+    stl = entry.get("stl_file")
+    target = step if step and Path(step).exists() else stl
 
     if not target or not Path(target).exists():
-        print(f"No viewable file found for model '{model_id}'.")
-        print(f"Source: {entry.get('py_file')}")
+        print(f"No built file for '{model_id}'. Build it first.")
         return
 
-    print(f"Opening {target} in 3D viewer...")
+    print(f"Opening viewer for {Path(target).name}...")
     subprocess.run(
         [
             "npm",
@@ -216,35 +167,37 @@ def cmd_view(model_id: str) -> None:
     )
 
 
-def cmd_queue(subcommand: str | None = None, args: list[str] | None = None) -> None:
+def cmd_queue(sub: str, rest: list[str]) -> None:
     """Manage the print queue."""
-    queue = _load_queue()
+    q = _queue()
 
-    if subcommand is None or subcommand == "list":
-        if not queue:
+    if sub == "list":
+        if not q:
             print("Print queue is empty.")
             return
-        print(f"{'Job ID':<10} {'Model':<25} {'Status':<12} {'Added'}")
-        print("-" * 65)
-        for job in sorted(queue.values(), key=lambda j: j["added_at"]):
-            added = job["added_at"][:16].replace("T", " ")
+        print(f"{'Job':<10} {'Model':<28} {'Qty':>4} {'Status':<10} {'Added'}")
+        print("-" * 68)
+        for job in sorted(q.values(), key=lambda j: j["added_at"]):
+            ts = job["added_at"][:16].replace("T", " ")
             print(
-                f"{job['id']:<10} {job['model_name']:<25} {job['status']:<12} {added}"
+                f"{job['id']:<10} {job['model_name']:<28} "
+                f"{job['quantity']:>4} {job['status']:<10} {ts}"
             )
         return
 
-    if subcommand == "add":
-        if not args:
-            print("Usage: queue add <model_id>")
+    if sub == "add":
+        if not rest:
+            print("Usage: queue add <model_id> [quantity]")
             return
-        model_id = args[0]
-        index = _load_models_index()
+        model_id = rest[0]
+        qty = int(rest[1]) if len(rest) > 1 else 1
+        index = _idx()
         entry = index.get(model_id)
         if not entry:
             print(f"Model '{model_id}' not found.")
             return
         job_id = str(uuid.uuid4())[:8]
-        queue[job_id] = {
+        q[job_id] = {
             "id": job_id,
             "model_id": model_id,
             "model_name": entry["name"],
@@ -252,210 +205,182 @@ def cmd_queue(subcommand: str | None = None, args: list[str] | None = None) -> N
             "stl_file": entry.get("stl_file"),
             "step_file": entry.get("step_file"),
             "status": "pending",
+            "quantity": qty,
             "added_at": datetime.now().isoformat(),
             "started_at": None,
             "completed_at": None,
-            "quantity": int(args[1]) if len(args) > 1 else 1,
         }
-        _save_json(QUEUE_FILE, queue)
-        print(f"Added job {job_id} for '{entry['name']}' to print queue.")
+        _save_json(QUEUE_FILE, q)
+        print(f"Queued job {job_id}: {qty}x {entry['name']}")
         return
 
-    if subcommand == "status":
-        if not args or len(args) < 2:
+    if sub == "status":
+        if len(rest) < 2:
             print("Usage: queue status <job_id> <pending|printing|done|failed>")
             return
-        job_id, new_status = args[0], args[1]
+        job_id, status = rest[0], rest[1]
         valid = {"pending", "printing", "done", "failed"}
-        if new_status not in valid:
+        if status not in valid:
             print(f"Status must be one of: {', '.join(sorted(valid))}")
             return
-        if job_id not in queue:
+        if job_id not in q:
             print(f"Job '{job_id}' not found.")
             return
-        queue[job_id]["status"] = new_status
-        if new_status == "printing":
-            queue[job_id]["started_at"] = datetime.now().isoformat()
-        elif new_status == "done":
-            queue[job_id]["completed_at"] = datetime.now().isoformat()
-        _save_json(QUEUE_FILE, queue)
-        print(f"Job {job_id} status updated to '{new_status}'.")
-
-        if new_status == "done":
-            print(f"Use 'inventory add {job_id} <price>' to list this print for sale.")
+        q[job_id]["status"] = status
+        if status == "printing":
+            q[job_id]["started_at"] = datetime.now().isoformat()
+        elif status in {"done", "failed"}:
+            q[job_id]["completed_at"] = datetime.now().isoformat()
+        _save_json(QUEUE_FILE, q)
+        print(f"Job {job_id} → {status}")
+        if status == "done":
+            print(f"Add to inventory: inventory add {job_id} <price>")
         return
 
-    print(f"Unknown queue subcommand '{subcommand}'. Use: list, add, status")
+    print(f"Unknown queue subcommand '{sub}'. Use: list, add, status")
 
 
-def cmd_inventory(
-    subcommand: str | None = None, args: list[str] | None = None
-) -> None:
-    """Manage the sales inventory."""
-    inventory = _load_inventory()
+def cmd_inventory(sub: str, rest: list[str]) -> None:
+    """Manage sales inventory."""
+    inv = _inv()
 
-    if subcommand is None or subcommand == "list":
-        if not inventory:
-            print("Inventory is empty. Complete prints and add them with 'inventory add'.")
+    if sub == "list":
+        if not inv:
+            print("Inventory is empty.")
             return
-        total_value = sum(
-            i["price"] * i["quantity_available"]
-            for i in inventory.values()
-        )
-        print(f"{'Item ID':<10} {'Name':<30} {'Price':>8} {'Qty':>5} {'Sold':>6}")
+        total_value = sum(i["price"] * i["qty_available"] for i in inv.values())
+        total_sold = sum(i["price"] * i["qty_sold"] for i in inv.values())
+        print(f"{'Item':<10} {'Name':<28} {'Price':>8} {'Avail':>6} {'Sold':>6}")
         print("-" * 65)
-        for item in sorted(inventory.values(), key=lambda i: i["added_at"]):
+        for item in sorted(inv.values(), key=lambda i: i["added_at"]):
             print(
-                f"{item['id']:<10} {item['name']:<30} "
-                f"${item['price']:>7.2f} {item['quantity_available']:>5} "
-                f"{item['quantity_sold']:>6}"
+                f"{item['id']:<10} {item['name']:<28} "
+                f"${item['price']:>7.2f} {item['qty_available']:>6} "
+                f"{item['qty_sold']:>6}"
             )
-        print(f"\nTotal available inventory value: ${total_value:.2f}")
+        print(f"\nInventory value: ${total_value:.2f}  |  Revenue: ${total_sold:.2f}")
         return
 
-    if subcommand == "add":
-        if not args or len(args) < 2:
+    if sub == "add":
+        if len(rest) < 2:
             print("Usage: inventory add <job_id> <price>")
             return
-        job_id, price_str = args[0], args[1]
+        job_id, price_str = rest[0], rest[1]
         try:
             price = float(price_str)
         except ValueError:
             print(f"Invalid price: {price_str}")
             return
-
-        queue = _load_queue()
-        job = queue.get(job_id)
+        q = _queue()
+        job = q.get(job_id)
         if not job:
-            print(f"Job '{job_id}' not found in print queue.")
+            print(f"Job '{job_id}' not found in queue.")
             return
-
         item_id = str(uuid.uuid4())[:8]
-        inventory[item_id] = {
+        inv[item_id] = {
             "id": item_id,
             "job_id": job_id,
             "model_id": job["model_id"],
             "name": job["model_name"],
             "description": job["description"],
             "price": price,
-            "quantity_available": job.get("quantity", 1),
-            "quantity_sold": 0,
+            "qty_available": job["quantity"],
+            "qty_sold": 0,
             "added_at": datetime.now().isoformat(),
         }
-        _save_json(INVENTORY_FILE, inventory)
-        print(
-            f"Added {job.get('quantity', 1)}x '{job['model_name']}' to inventory at ${price:.2f} each."
-        )
+        _save_json(INVENTORY_FILE, inv)
+        print(f"Listed {job['quantity']}x {job['model_name']} @ ${price:.2f} (item {item_id})")
         return
 
-    if subcommand == "sell":
-        if not args or len(args) < 2:
+    if sub == "sell":
+        if len(rest) < 2:
             print("Usage: inventory sell <item_id> <quantity>")
             return
-        item_id, qty_str = args[0], args[1]
+        item_id, qty_str = rest[0], rest[1]
         try:
             qty = int(qty_str)
         except ValueError:
             print(f"Invalid quantity: {qty_str}")
             return
-
-        if item_id not in inventory:
+        if item_id not in inv:
             print(f"Item '{item_id}' not found.")
             return
-        item = inventory[item_id]
-        if qty > item["quantity_available"]:
-            print(
-                f"Only {item['quantity_available']} available "
-                f"(requested {qty})."
-            )
+        item = inv[item_id]
+        if qty > item["qty_available"]:
+            print(f"Only {item['qty_available']} available.")
             return
-        item["quantity_available"] -= qty
-        item["quantity_sold"] += qty
-        _save_json(INVENTORY_FILE, inventory)
-        revenue = qty * item["price"]
-        print(
-            f"Sold {qty}x '{item['name']}' for ${revenue:.2f}. "
-            f"Remaining: {item['quantity_available']}."
-        )
+        item["qty_available"] -= qty
+        item["qty_sold"] += qty
+        _save_json(INVENTORY_FILE, inv)
+        print(f"Sold {qty}x {item['name']} = ${qty * item['price']:.2f}")
         return
 
-    print(f"Unknown inventory subcommand '{subcommand}'. Use: list, add, sell")
+    print(f"Unknown inventory subcommand '{sub}'. Use: list, add, sell")
 
 
 def cmd_summary() -> None:
-    """Show a summary of the print farm."""
-    index = _load_models_index()
-    queue = _load_queue()
-    inventory = _load_inventory()
+    """Print farm dashboard."""
+    index = _idx()
+    q = _queue()
+    inv = _inv()
 
-    total_models = len(index)
-    ok_models = sum(1 for e in index.values() if e.get("generation_ok"))
-
-    queue_by_status: dict[str, int] = {}
-    for job in queue.values():
+    by_status: dict[str, int] = {}
+    for job in q.values():
         s = job["status"]
-        queue_by_status[s] = queue_by_status.get(s, 0) + 1
+        by_status[s] = by_status.get(s, 0) + 1
 
-    total_revenue = sum(
-        i["price"] * i["quantity_sold"] for i in inventory.values()
-    )
-    inventory_value = sum(
-        i["price"] * i["quantity_available"] for i in inventory.values()
-    )
+    revenue = sum(i["price"] * i["qty_sold"] for i in inv.values())
+    inv_value = sum(i["price"] * i["qty_available"] for i in inv.values())
+    built = sum(1 for e in index.values() if e.get("built"))
 
-    print("=== 3D Print Farm Summary ===")
-    print(f"Models generated : {ok_models}/{total_models}")
-    print(f"Queue - pending  : {queue_by_status.get('pending', 0)}")
-    print(f"Queue - printing : {queue_by_status.get('printing', 0)}")
-    print(f"Queue - done     : {queue_by_status.get('done', 0)}")
-    print(f"Inventory items  : {len(inventory)}")
-    print(f"Inventory value  : ${inventory_value:.2f}")
-    print(f"Total revenue    : ${total_revenue:.2f}")
+    print("=== Print Farm Summary ===")
+    print(f"Models       : {built} built / {len(index)} total")
+    print(f"Queue pending: {by_status.get('pending', 0)}")
+    print(f"Printing now : {by_status.get('printing', 0)}")
+    print(f"Completed    : {by_status.get('done', 0)}")
+    print(f"Inventory    : {len(inv)} listings  (value ${inv_value:.2f})")
+    print(f"Revenue      : ${revenue:.2f}")
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(
+    p = argparse.ArgumentParser(
         prog="print_farm_bot",
-        description="3D Print Farm Bot — generate, view, queue, and sell 3D prints using Claude AI.",
+        description="3D Print Farm Bot — manage and sell 3D prints.",
     )
-    sub = parser.add_subparsers(dest="command", metavar="COMMAND")
+    sub = p.add_subparsers(dest="command", metavar="COMMAND")
 
-    # generate
-    gen_p = sub.add_parser("generate", help="Generate a 3D model from a text description")
-    gen_p.add_argument("description", help="What to generate (e.g. 'small gear with 20 teeth')")
-    gen_p.add_argument("--name", help="Optional short name for the model file")
+    # new — used by Claude Code's /generate to reserve a model slot
+    n = sub.add_parser("new", help="Reserve a model slot and print its file paths")
+    n.add_argument("name", help="Short model name (no spaces)")
+    n.add_argument("description", help="What this model is")
+
+    # build — run CAD pipeline on a registered model
+    b = sub.add_parser("build", help="Run the CAD pipeline for a registered model")
+    b.add_argument("model_id", help="Model ID from 'list'")
 
     # list
-    sub.add_parser("list", help="List all generated models")
+    sub.add_parser("list", help="List all models")
 
     # view
-    view_p = sub.add_parser("view", help="View a model in the 3D viewer")
-    view_p.add_argument("model_id", help="Model ID from 'list'")
+    v = sub.add_parser("view", help="Open a model in the 3D viewer")
+    v.add_argument("model_id")
 
     # queue
-    queue_p = sub.add_parser("queue", help="Manage the print queue")
-    queue_p.add_argument(
-        "subcommand",
-        nargs="?",
-        choices=["list", "add", "status"],
-        default="list",
-    )
-    queue_p.add_argument("rest", nargs="*", help="Arguments for the subcommand")
+    qp = sub.add_parser("queue", help="Manage the print queue")
+    qp.add_argument("subcommand", nargs="?", default="list",
+                    choices=["list", "add", "status"])
+    qp.add_argument("rest", nargs="*")
 
     # inventory
-    inv_p = sub.add_parser("inventory", help="Manage sales inventory")
-    inv_p.add_argument(
-        "subcommand",
-        nargs="?",
-        choices=["list", "add", "sell"],
-        default="list",
-    )
-    inv_p.add_argument("rest", nargs="*", help="Arguments for the subcommand")
+    ip = sub.add_parser("inventory", help="Manage sales inventory")
+    ip.add_argument("subcommand", nargs="?", default="list",
+                    choices=["list", "add", "sell"])
+    ip.add_argument("rest", nargs="*")
 
     # summary
-    sub.add_parser("summary", help="Show print farm summary")
+    sub.add_parser("summary", help="Print farm dashboard")
 
-    return parser
+    return p
 
 
 def main() -> int:
@@ -466,8 +391,10 @@ def main() -> int:
         parser.print_help()
         return 0
 
-    if args.command == "generate":
-        cmd_generate(args.description, name=args.name)
+    if args.command == "new":
+        cmd_new(args.name, args.description)
+    elif args.command == "build":
+        cmd_build(args.model_id)
     elif args.command == "list":
         cmd_list()
     elif args.command == "view":
@@ -478,8 +405,6 @@ def main() -> int:
         cmd_inventory(args.subcommand, args.rest)
     elif args.command == "summary":
         cmd_summary()
-    else:
-        parser.print_help()
 
     return 0
 

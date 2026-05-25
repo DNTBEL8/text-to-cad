@@ -1,57 +1,65 @@
 # 3D Print Farm Bot
 
-This project includes a 3D print farm bot at `print_farm_bot.py` that uses Claude AI to generate 3D-printable models from text, manage a print queue, and track sales inventory.
+This project has a print farm management tool at `print_farm_bot.py` and a full CAD pipeline in `skills/cad/`. When the user asks to generate, view, print, or sell 3D models, handle it directly — never ask the user to run commands themselves.
 
-## How to help the user
+## How generation works (no external API key needed)
 
-When the user asks to generate, view, print, queue, or sell 3D models — run the bot for them using Bash. Never ask them to run it themselves.
+You ARE the AI. When asked to generate a model:
+1. Run `python print_farm_bot.py new <name> "<description>"` to reserve a slot and get file paths
+2. Write the build123d Python code yourself to the `py_file` path it prints
+3. Run `python print_farm_bot.py build <model_id>` to generate STEP + STL via the CAD pipeline
+4. Offer to view it or queue it for printing
 
-Requires `ANTHROPIC_API_KEY` to be set in the environment.
+## build123d code rules
+
+- Import only from build123d: `from build123d import *`
+- Named parameters at top, dimensions in millimeters
+- Single `gen_step()` function returning a Shape or Compound
+- Closed, manifold, FDM-printable solid; walls ≥ 1.5 mm
+- No file I/O, no display calls, no `__main__` block
 
 ## Bot commands
 
 ```bash
-# Generate a 3D model from text (takes 30-60s — use streaming/patience)
-python print_farm_bot.py generate "description of object"
-python print_farm_bot.py generate "description" --name short_name
-
-# List all generated models
-python print_farm_bot.py list
-
-# Open a model in the 3D viewer
-python print_farm_bot.py view <model_id>
-
-# Print queue management
-python print_farm_bot.py queue                       # list queue
-python print_farm_bot.py queue add <model_id>        # add to queue
-python print_farm_bot.py queue add <model_id> 5      # queue 5 copies
-python print_farm_bot.py queue status <job_id> printing
-python print_farm_bot.py queue status <job_id> done
-
-# Inventory and sales
-python print_farm_bot.py inventory                        # list inventory
-python print_farm_bot.py inventory add <job_id> <price>   # list for sale
-python print_farm_bot.py inventory sell <item_id> <qty>   # record a sale
-
-# Dashboard
-python print_farm_bot.py summary
+python print_farm_bot.py new <name> "<description>"    # reserve slot, get file paths
+python print_farm_bot.py build <model_id>              # run CAD pipeline
+python print_farm_bot.py list                          # list all models
+python print_farm_bot.py view <model_id>               # open in 3D viewer
+python print_farm_bot.py queue                         # show print queue
+python print_farm_bot.py queue add <model_id> [qty]   # add to queue
+python print_farm_bot.py queue status <job_id> <printing|done|failed>
+python print_farm_bot.py inventory                     # show inventory
+python print_farm_bot.py inventory add <job_id> <price>
+python print_farm_bot.py inventory sell <item_id> <qty>
+python print_farm_bot.py summary                       # dashboard
 ```
 
-## Data locations
+## CAD pipeline detail
 
-- Generated models: `print_farm/models/<id>/`
-- Model index: `print_farm/models_index.json`
-- Print queue: `print_farm/queue.json`
-- Inventory: `print_farm/inventory.json`
+The `build` command runs from `skills/cad/` and calls:
+```
+python scripts/step <py_file> --stl <stl_name> --skip-explorer --verbose
+```
+STEP and STL are written next to the Python source file in `print_farm/models/<model_id>/`.
 
-## Workflow
+## Viewer
 
-Generate → view → queue → mark done → add to inventory → sell
+The render skill viewer is started with:
+```bash
+npm --prefix scripts/viewer run dev:ensure -- --file <path>
+```
+Run from `skills/render/`.
 
-## Slash commands available
+## Data files
 
-- `/generate` — generate a 3D model from text
-- `/view` — open a model in the 3D viewer
-- `/queue` — manage print queue
-- `/inventory` — manage sales inventory
-- `/farm-summary` — show print farm dashboard
+- `print_farm/models_index.json` — all generated models
+- `print_farm/queue.json` — print queue jobs
+- `print_farm/inventory.json` — sales inventory
+
+## Slash commands
+
+- `/generate <description>` — generate a model end-to-end
+- `/view <model_id>` — open in 3D viewer
+- `/queue [add|status] ...` — manage print queue
+- `/inventory [add|sell] ...` — manage sales
+- `/farm-summary` — full dashboard
