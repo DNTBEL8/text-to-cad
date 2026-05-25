@@ -59,6 +59,12 @@ python print_farm_bot.py summary                            # dashboard
 - `print_farm/models_index.json` — models (includes review + approval fields)
 - `print_farm/queue.json` — print jobs
 - `print_farm/inventory.json` — sales listings
+- `print_farm/MARKET.md` — market research: best-selling categories, pricing, platforms, top designs to generate
+
+## Market guidance
+
+When the user asks what to make, what sells, or how to price/sell — read `print_farm/MARKET.md`.
+The top 10 designs at the bottom of MARKET.md are pre-researched high-ROI items ready to generate.
 
 ## Slash commands
 
