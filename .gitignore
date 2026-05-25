@@ -27,3 +27,6 @@ coverage
 *.tmp
 *.swp
 tmp/
+
+# Print farm generated data (models, queue, inventory)
+print_farm/
