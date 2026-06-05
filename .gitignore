@@ -27,3 +27,8 @@ coverage
 *.tmp
 *.swp
 tmp/
+
+# Print farm generated data (models, queue, inventory)
+print_farm/
+# But keep the market intelligence doc
+!print_farm/MARKET.md
