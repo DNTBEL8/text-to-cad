@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/env python3.13
 """3D Print Farm Bot - manage and track 3D prints for a print farm business."""
 
 from __future__ import annotations
@@ -101,17 +101,19 @@ def cmd_build(model_id: str) -> None:
         sys.exit(1)
 
     print(f"Building {py_file.name}...")
-    result = subprocess.run(
-        [
-            sys.executable,
-            "scripts/step",
-            str(py_file.resolve()),
-            "--stl",
-            stl_name,
-            "--verbose",
-        ],
-        cwd=str(SKILL_DIR),
-    )
+    build_script = f"""
+import sys, importlib.util
+sys.path.insert(0, {str(py_file.parent)!r})
+spec = importlib.util.spec_from_file_location("_model", {str(py_file)!r})
+mod = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(mod)
+shape = mod.gen_step()
+from build123d import export_step, export_stl
+export_step(shape, {str(step_file)!r})
+export_stl(shape, {str(stl_file)!r})
+print("STEP+STL exported")
+"""
+    result = subprocess.run([sys.executable, "-c", build_script], capture_output=False)
 
     ok = result.returncode == 0 and step_file.exists()
 
